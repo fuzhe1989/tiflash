@@ -39,11 +39,6 @@
 #endif
 
 
-namespace CurrentMetrics
-{
-extern const Metric SendExternalTables;
-}
-
 namespace DB
 {
 namespace ErrorCodes
@@ -420,64 +415,6 @@ void Connection::sendPreparedData(ReadBuffer & input, size_t size, const String 
 }
 
 
-void Connection::sendExternalTablesData(ExternalTablesData & data)
-{
-    if (data.empty())
-    {
-        /// Send empty block, which means end of data transfer.
-        sendData(Block());
-        return;
-    }
-
-    Stopwatch watch;
-    size_t out_bytes = out ? out->count() : 0;
-    size_t maybe_compressed_out_bytes = maybe_compressed_out ? maybe_compressed_out->count() : 0;
-    size_t rows = 0;
-
-    CurrentMetrics::Increment metric_increment{CurrentMetrics::SendExternalTables};
-
-    for (auto & elem : data)
-    {
-        elem.first->readPrefix();
-        while (Block block = elem.first->read())
-        {
-            rows += block.rows();
-            sendData(block, elem.second);
-        }
-        elem.first->readSuffix();
-    }
-
-    /// Send empty block, which means end of data transfer.
-    sendData(Block());
-
-    out_bytes = out->count() - out_bytes;
-    maybe_compressed_out_bytes = maybe_compressed_out->count() - maybe_compressed_out_bytes;
-
-    auto get_logging_msg = [&]() -> String {
-        const double elapsed_seconds = watch.elapsedSeconds();
-
-        FmtBuffer fmt_buf;
-        fmt_buf.fmtAppend(
-            "Sent data for {} external tables, total {} rows in {:.3f} sec., {:.3f} rows/sec., "
-            "{:.3f} MiB ({:.3f} MiB/sec.)",
-            data.size(),
-            rows,
-            elapsed_seconds,
-            1.0 * rows / elapsed_seconds,
-            maybe_compressed_out_bytes / 1048576.0,
-            maybe_compressed_out_bytes / 1048576.0 / elapsed_seconds);
-
-        if (compression == Protocol::Compression::Enable)
-            fmt_buf.fmtAppend(", compressed {:.3f} times to {:.3f} MiB ({:.3f} MiB/sec.)", 1.0 * maybe_compressed_out_bytes / out_bytes, out_bytes / 1048576.0, out_bytes / 1048576.0 / elapsed_seconds);
-        else
-            fmt_buf.append(", no compression.");
-        return fmt_buf.toString();
-    };
-
-    LOG_DEBUG(log_wrapper.get(), get_logging_msg());
-}
-
-
 bool Connection::poll(size_t timeout_microseconds)
 {
     return static_cast<ReadBufferFromPocoSocket &>(*in).poll(timeout_microseconds);
@@ -547,27 +484,6 @@ Connection::Packet Connection::receivePacket()
 
         throw;
     }
-}
-
-
-Block Connection::receiveData()
-{
-    //LOG_FMT_TRACE(log_wrapper.get(), "Receiving data");
-
-    initBlockInput();
-
-    String external_table_name;
-    readStringBinary(external_table_name, *in);
-
-    size_t prev_bytes = in->count();
-
-    /// Read one block from network.
-    Block res = block_in->read();
-
-    if (throttler)
-        throttler->add(in->count() - prev_bytes);
-
-    return res;
 }
 
 

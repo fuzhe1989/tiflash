@@ -223,10 +223,6 @@ ExpressionAnalyzer::ExpressionAnalyzer(
     /// Delete the unnecessary from `source_columns` list. Create `unknown_required_source_columns`. Form `columns_added_by_join`.
     collectUsedColumns();
 
-    /// external_tables, subqueries_for_sets for global subqueries.
-    /// Replaces global subqueries with the generated names of temporary tables that will be sent to remote servers.
-    initGlobalSubqueriesAndExternalTables();
-
     /// has_aggregation, aggregation_keys, aggregate_descriptions, aggregated_columns.
     /// This analysis should be performed after processing global subqueries, because otherwise,
     /// if the aggregate function contains a global subquery, then `analyzeAggregation` method will save
@@ -583,58 +579,6 @@ void ExpressionAnalyzer::analyzeAggregation()
 }
 
 
-void ExpressionAnalyzer::initGlobalSubqueriesAndExternalTables()
-{
-    /// Adds existing external tables (not subqueries) to the external_tables dictionary.
-    findExternalTables(ast);
-
-    /// Converts GLOBAL subqueries to external tables; Puts them into the external_tables dictionary: name -> StoragePtr.
-    initGlobalSubqueries(ast);
-}
-
-
-void ExpressionAnalyzer::initGlobalSubqueries(ASTPtr & ast)
-{
-    /// Recursive calls. We do not go into subqueries.
-
-    for (auto & child : ast->children)
-        if (!typeid_cast<ASTSelectQuery *>(child.get()))
-            initGlobalSubqueries(child);
-
-    /// Bottom-up actions.
-
-    if (ASTFunction * node = typeid_cast<ASTFunction *>(ast.get()))
-    {
-        /// For GLOBAL IN.
-        if (do_global && (node->name == "globalIn" || node->name == "globalNotIn"))
-            addExternalStorage(node->arguments->children.at(1));
-    }
-    else if (ASTTablesInSelectQueryElement * node = typeid_cast<ASTTablesInSelectQueryElement *>(ast.get()))
-    {
-        /// For GLOBAL JOIN.
-        if (do_global && node->table_join
-            && static_cast<const ASTTableJoin &>(*node->table_join).locality == ASTTableJoin::Locality::Global)
-            addExternalStorage(node->table_expression);
-    }
-}
-
-
-void ExpressionAnalyzer::findExternalTables(ASTPtr & ast)
-{
-    /// Traverse from the bottom. Intentionally go into subqueries.
-    for (auto & child : ast->children)
-        findExternalTables(child);
-
-    /// If table type identifier
-    StoragePtr external_storage;
-
-    if (ASTIdentifier * node = typeid_cast<ASTIdentifier *>(ast.get()))
-        if (node->kind == ASTIdentifier::Table)
-            if ((external_storage = context.tryGetExternalTable(node->name)))
-                external_tables[node->name] = external_storage;
-}
-
-
 static std::pair<String, String> getDatabaseAndTableNameFromIdentifier(const ASTIdentifier & identifier)
 {
     std::pair<String, String> res;
@@ -756,97 +700,6 @@ static std::shared_ptr<InterpreterSelectWithUnionQuery> interpretSubquery(
         required_source_columns,
         QueryProcessingStage::Complete,
         subquery_depth + 1);
-}
-
-
-void ExpressionAnalyzer::addExternalStorage(ASTPtr & subquery_or_table_name_or_table_expression)
-{
-    /// With nondistributed queries, creating temporary tables does not make sense.
-    if (!(storage && storage->isRemote()))
-        return;
-
-    ASTPtr subquery;
-    ASTPtr table_name;
-    ASTPtr subquery_or_table_name;
-
-    if (typeid_cast<const ASTIdentifier *>(subquery_or_table_name_or_table_expression.get()))
-    {
-        table_name = subquery_or_table_name_or_table_expression;
-        subquery_or_table_name = table_name;
-    }
-    else if (const auto * ast_table_expr = typeid_cast<const ASTTableExpression *>(subquery_or_table_name_or_table_expression.get()))
-    {
-        if (ast_table_expr->database_and_table_name)
-        {
-            table_name = ast_table_expr->database_and_table_name;
-            subquery_or_table_name = table_name;
-        }
-        else if (ast_table_expr->subquery)
-        {
-            subquery = ast_table_expr->subquery;
-            subquery_or_table_name = subquery;
-        }
-    }
-    else if (typeid_cast<const ASTSubquery *>(subquery_or_table_name_or_table_expression.get()))
-    {
-        subquery = subquery_or_table_name_or_table_expression;
-        subquery_or_table_name = subquery;
-    }
-
-    if (!subquery_or_table_name)
-        throw Exception("Logical error: unknown AST element passed to ExpressionAnalyzer::addExternalStorage method", ErrorCodes::LOGICAL_ERROR);
-
-    if (table_name)
-    {
-        /// If this is already an external table, you do not need to add anything. Just remember its presence.
-        if (external_tables.end() != external_tables.find(static_cast<const ASTIdentifier &>(*table_name).name))
-            return;
-    }
-
-    /// Generate the name for the external table.
-    String external_table_name = "_data" + toString(external_table_id);
-    while (external_tables.count(external_table_name))
-    {
-        ++external_table_id;
-        external_table_name = "_data" + toString(external_table_id);
-    }
-
-    auto interpreter = interpretSubquery(subquery_or_table_name, context, subquery_depth, {});
-
-    Block sample = interpreter->getSampleBlock();
-    NamesAndTypesList columns = sample.getNamesAndTypesList();
-
-    StoragePtr external_storage = StorageMemory::create(external_table_name, ColumnsDescription{columns});
-    external_storage->startup();
-
-    /** We replace the subquery with the name of the temporary table.
-        * It is in this form, the request will go to the remote server.
-        * This temporary table will go to the remote server, and on its side,
-        *  instead of doing a subquery, you just need to read it.
-        */
-
-    auto database_and_table_name = std::make_shared<ASTIdentifier>(external_table_name, ASTIdentifier::Table);
-
-    if (auto * ast_table_expr = typeid_cast<ASTTableExpression *>(subquery_or_table_name_or_table_expression.get()))
-    {
-        ast_table_expr->subquery.reset();
-        ast_table_expr->database_and_table_name = database_and_table_name;
-
-        ast_table_expr->children.clear();
-        ast_table_expr->children.emplace_back(database_and_table_name);
-    }
-    else
-        subquery_or_table_name_or_table_expression = database_and_table_name;
-
-    external_tables[external_table_name] = external_storage;
-    subqueries_for_sets[external_table_name].source = interpreter->execute().in;
-    subqueries_for_sets[external_table_name].table = external_storage;
-
-    /** NOTE If it was written IN tmp_table - the existing temporary (but not external) table,
-      *  then a new temporary table will be created (for example, _data1),
-      *  and the data will then be copied to it.
-      * Maybe this can be avoided.
-      */
 }
 
 

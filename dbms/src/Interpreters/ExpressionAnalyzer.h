@@ -146,10 +146,6 @@ public:
 
     PreparedSets getPreparedSets() { return prepared_sets; }
 
-    /** Tables that will need to be sent to remote servers for distributed query processing.
-      */
-    const Tables & getExternalTables() const { return external_tables; }
-
     /// Create Set-s that we can from IN section to use the index on them.
     void makeSetsForIndex();
 
@@ -220,10 +216,6 @@ private:
     NameToNameMap array_join_name_to_alias;
 
 
-    /// All new temporary tables obtained by performing the GLOBAL IN/JOIN subqueries.
-    Tables external_tables;
-    size_t external_table_id = 1;
-
     /** Remove all unnecessary columns from the list of all available columns of the table (`columns`).
       * At the same time, form a set of unknown columns (`unknown_required_source_columns`),
       * as well as the columns added by JOIN (`columns_added_by_join`).
@@ -265,18 +257,6 @@ private:
     /// Replacing scalar subqueries with constant values.
     void executeScalarSubqueries();
     void executeScalarSubqueriesImpl(ASTPtr & ast);
-
-    /// Find global subqueries in the GLOBAL IN/JOIN sections. Fills in external_tables.
-    void initGlobalSubqueriesAndExternalTables();
-    void initGlobalSubqueries(ASTPtr & ast);
-
-    /// Finds in the query the usage of external tables (as table identifiers). Fills in external_tables.
-    void findExternalTables(ASTPtr & ast);
-
-    /** Initialize InterpreterSelectQuery for a subquery in the GLOBAL IN/JOIN section,
-      * create a temporary table of type Memory and store it in the external_tables dictionary.
-      */
-    void addExternalStorage(ASTPtr & subquery_or_table_name);
 
     void getArrayJoinedColumns();
     void getArrayJoinedColumnsImpl(const ASTPtr & ast);

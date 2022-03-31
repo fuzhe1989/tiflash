@@ -202,11 +202,6 @@ void InterpreterSelectQuery::init(const Names & required_result_column_names)
 
         if (query.prewhere_expression && (input || !storage || !storage->supportsPrewhere()))
             throw Exception((!input && storage) ? "Storage " + storage->getName() + " doesn't support PREWHERE" : "Illegal PREWHERE", ErrorCodes::ILLEGAL_PREWHERE);
-
-        /// Save the new temporary tables in the query context
-        for (const auto & it : query_analyzer->getExternalTables())
-            if (!context.tryGetExternalTable(it.first))
-                context.addExternalTable(it.first, it.second);
     }
 }
 
